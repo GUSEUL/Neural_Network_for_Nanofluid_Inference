@@ -384,15 +384,10 @@ def train_model(args, model, train_loader, val_loader, device):
     with open(history_path, 'w') as f:
         json.dump(loss_history, f, indent=4)
     print(f"  [History Saved] Loss history written to {history_path}")
-        
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), f'checkpoint_best_{args.base_fluid}.pth')
-            print(f"  [Model Saved] Best Val Loss: {best_val_loss:.6f}")
 
-# =============================================================================
-# 4. Ultra Inference Logic
-# =============================================================================
+    # =============================================================================
+    # 4. Ultra Inference Logic
+    # =============================================================================
 def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, norm_weights=None, num_restarts=4):
     model.eval()
     num_samples = min(config.get('num_inference_samples', 20), len(dataset))
@@ -512,7 +507,7 @@ def main():
             cp = preprocess_to_hdf5(f, cache_dir)
             if cp: caches.append(CachedSequenceDataset(cp))
         ds = ConcatDataset(caches)
-        return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, num_workers=4, pin_memory=True)
+        return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, num_workers=0, pin_memory=True)
 
     if not args.inference_only:
         train_loader = get_loader(train_files)

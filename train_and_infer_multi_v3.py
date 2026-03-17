@@ -507,7 +507,7 @@ def main():
             cp = preprocess_to_hdf5(f, cache_dir)
             if cp: caches.append(CachedSequenceDataset(cp))
         ds = ConcatDataset(caches)
-        return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, num_workers=0, pin_memory=True)
+        return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, num_workers=8, pin_memory=True)
 
     if not args.inference_only:
         train_loader = get_loader(train_files)

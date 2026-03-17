@@ -30,5 +30,5 @@ pip install -r requirements.txt
 
 ## How to run
 
-For training: python train_and_infer_multi_v3.py --base_fluid EG --epochs 100
-For inference:  python train_and_infer_multi_v3.py --inference_only --base_fluid EG
+-For training: python train_and_infer_multi_v3.py --base_fluid EG --epochs 100
+-For inference:  python train_and_infer_multi_v3.py --inference_only --base_fluid EG

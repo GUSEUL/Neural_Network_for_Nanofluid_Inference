@@ -1,53 +1,12 @@
-# Python cache files
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
+*
 
-# PyTorch model files (large)
-*.pth
-*.pt
+!.gitignore
+!README.md
+!TRAIN_AND_INFER_MULTI_V2_DETAILED_GUIDE.md
+!requirements.txt
+!data.py
+!models.py
+!train_and_infer_multi.py
 
-# Large data files
-*.mat
-*.h5
-*.hdf5
-
-# Animation and image files (large)
-*.gif
-*.mp4
-*.avi
-*.mov
-complete_animations/
-complete_physics_results/
-
-# Jupyter notebook checkpoints
-.ipynb_checkpoints/
-
-# Environment files
-.env
-.venv
-env/
-venv/
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Large numpy arrays
-*.npy
-*.npz
-
-# Logs
-*.log
-logs/
-
-# Temporary files
-*.tmp
-*.temp 
+!data/
+data/*

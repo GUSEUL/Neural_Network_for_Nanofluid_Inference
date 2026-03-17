@@ -217,10 +217,11 @@ class MultiParamPhysicsLoss(nn.Module):
         rhs = dudt + ux*ux_x + vx*ux_y + px_x - self.nu_r*self.Pr*(ux_xx+ux_yy)
         da_inferred = -(self.nu_r * self.Pr * ux) / (rhs + 1e-8)
         da_inferred = torch.clamp(da_inferred, 0.001, 0.2)
-        
-        mse = F.mse_loss(da_inferred, d_guess.view_as(da_inferred), reduction='none').mean(dim=[1, 2, 3])
-        return mse, da_inferred.mean()
 
+        # da_inferred is [B, 1, H, W], d_guess is [B]
+        d_target = d_guess.view(-1, 1, 1, 1).expand_as(da_inferred)
+        mse = F.mse_loss(da_inferred, d_target, reduction='none').mean(dim=[1, 2, 3])
+        return mse, da_inferred.mean()
     def ra_consistency_loss(self, un, vn, pn_x, un_x, vn_x, tn_x, r_guess, d_val, h_val, steady=False):
         z_t = torch.zeros_like(un)
         u, v, _, _ = self.unnorm(un, vn, z_t, z_t)
@@ -234,7 +235,9 @@ class MultiParamPhysicsLoss(nn.Module):
         ra_inferred = rhs / (self.beta_r * self.Pr * tx + 1e-8)
         ra_inferred = torch.clamp(ra_inferred, 100, 1e8)
         
-        mse = F.mse_loss(ra_inferred / 1e6, r_guess.view_as(ra_inferred) / 1e6, reduction='none').mean(dim=[1, 2, 3])
+        # ra_inferred is [B, 1, H, W], r_guess is [B]
+        r_target = r_guess.view(-1, 1, 1, 1).expand_as(ra_inferred)
+        mse = F.mse_loss(ra_inferred / 1e6, r_target / 1e6, reduction='none').mean(dim=[1, 2, 3])
         return mse, ra_inferred.mean()
 
     def ha_consistency_loss(self, un, vn, pn_x, un_x, vn_x, tn_x, h_guess, r_val, d_val, steady=False):
@@ -250,7 +253,9 @@ class MultiParamPhysicsLoss(nn.Module):
         ha_sq_inferred = rhs / (self.sigma_r * self.rho_r * self.Pr * vx + 1e-8)
         ha_inferred = torch.sqrt(torch.clamp(ha_sq_inferred, 0, 10000))
         
-        mse = F.mse_loss(ha_inferred, h_guess.view_as(ha_inferred), reduction='none').mean(dim=[1, 2, 3])
+        # ha_inferred is [B, 1, H, W], h_guess is [B]
+        h_target = h_guess.view(-1, 1, 1, 1).expand_as(ha_inferred)
+        mse = F.mse_loss(ha_inferred, h_target, reduction='none').mean(dim=[1, 2, 3])
         return mse, ha_inferred.mean()
 
     def q_consistency_loss(self, un, vn, tn, tn_x, q_guess, steady=False):
@@ -264,7 +269,9 @@ class MultiParamPhysicsLoss(nn.Module):
         q_inferred = rhs / (self.cp_r * tx + 1e-8)
         q_inferred = torch.clamp(q_inferred, -10, 10)
         
-        mse = F.mse_loss(q_inferred, q_guess.view_as(q_inferred), reduction='none').mean(dim=[1, 2, 3])
+        # q_inferred is [B, 1, H, W], q_guess is [B]
+        q_target = q_guess.view(-1, 1, 1, 1).expand_as(q_inferred)
+        mse = F.mse_loss(q_inferred, q_target, reduction='none').mean(dim=[1, 2, 3])
         return mse, q_inferred.mean()
 
 # =============================================================================
@@ -450,7 +457,7 @@ def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, 
         optimizer_adam.step()
         scheduler_adam.step()
 
-        if step % 100 == 0:
+        if step % 10 == 0:
             bi = torch.argmin(l_data).item()
             print(f"      Step {step:4d} | Best Ra:{ra[bi]:.2e} Ha:{ha[bi]:.2f} Q:{q[bi]:.2f} Da:{da[bi]:.4f} | Data Loss: {l_data[bi]:.6f}")
 
@@ -542,6 +549,13 @@ def main():
 
     for f_path in test_files[:5]: 
         ds_mat = MatDataset(f_path, device=device)
+        
+        # Print Ground Truth first
+        print(f"\n" + "="*50)
+        print(f"FILE: {os.path.basename(f_path)}")
+        print(f"GROUND TRUTH: " + ", ".join([f"{p}={ds_mat.params.get(p):.4f}" for p in ['Ra', 'Ha', 'Q', 'Da']]))
+        print("="*50)
+
         ds_seq = CachedSequenceDataset(preprocess_to_hdf5(f_path, cache_dir), device=device)
         phys = MultiParamPhysicsLoss(ds_mat.params, ds_mat.nanofluid_props, 
                                     dt=ds_mat.params['dt'], dx=1.0/(ds_mat.nx-1), dy=1.0/(ds_mat.ny-1)).to(device)

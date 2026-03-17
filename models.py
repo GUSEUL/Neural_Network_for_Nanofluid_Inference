@@ -1,26 +1,19 @@
-"""
-Neural network models for PhyCRNet.
-Includes PhyCRNet and its components (ConvLSTM, ResBlock).
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
-class PhyCRNet(nn.Module):
-    """Physics-informed Convolutional-Recurrent Network."""
-    
-    def __init__(self, ch=4, hidden=192, upscale=1, dropout_rate=0.2, predict_rd=True):
+class STNNN(nn.Module):
+    """
+    Spatiotemporal Neural Network (STNNN) - Physics-informed Convolutional-Recurrent Network.
+    Compatible with existing checkpoints.
+    """
+    def __init__(self, input_ch=4, output_ch=4, hidden=192, upscale=1, dropout_rate=0.2):
         super().__init__()
-        
-        self.predict_rd = predict_rd
-        self.input_ch = ch
-        # Output channels: 4 original + 1 for Rd if predicting
-        self.output_ch = ch + (1 if predict_rd else 0)
         
         # Encoder
         self.enc = nn.Sequential(
-            nn.Conv2d(ch, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(input_ch, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
             nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
             nn.Conv2d(128, hidden, 3, padding=1), nn.BatchNorm2d(hidden), nn.ReLU(),
             nn.Dropout2d(dropout_rate)
@@ -32,620 +25,217 @@ class PhyCRNet(nn.Module):
         # Residual block
         self.residual_block = ResidualBlock(hidden, hidden)
         
-        # Decoder for main fields (U, V, T, P)
+        # Decoder
         self.dec = nn.Sequential(
             nn.Conv2d(hidden, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
             nn.Conv2d(128, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
             nn.Dropout2d(dropout_rate/2),
-            nn.Conv2d(64, ch*(upscale**2), 3, padding=1),
+            nn.Conv2d(64, output_ch*(upscale**2), 3, padding=1),
             nn.PixelShuffle(upscale) if upscale > 1 else nn.Identity()
         )
         
-        # Rd prediction head (if enabled)
-        if predict_rd:
-            self.rd_head = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),  # Global average pooling
-                nn.Flatten(),
-                nn.Linear(hidden, hidden//4),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden//4, 64),
-                nn.ReLU(),
-                nn.Linear(64, 1),
-                nn.Softplus()  # Ensure positive Rd values
-            )
-        
         self._initialize_weights()
-        self.up = upscale
 
     def _initialize_weights(self):
-        """Initialize network weights using He initialization."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
         
     def forward(self, x):
-        """Forward pass through the network.
-        
-        Args:
-            x (torch.Tensor): Input tensor [B×C×H×W]
-            
-        Returns:
-            torch.Tensor: Output tensor [B×(C+1)×H×W] if predict_rd=True, else [B×C×H×W]
-            If predict_rd=True, the last channel contains spatially-replicated Rd values
-        """
-        # Encoding
-        z = self.enc(x)                           # B×hidden×H×W
-        
-        # ConvLSTM processing
-        z = z.unsqueeze(1)                        # B×1×hidden×H×W
-        z, _ = self.conv_lstm(z)                  # B×1×hidden×H×W
-        z = z.squeeze(1)                          # B×hidden×H×W
-        
-        # Residual processing
-        z = self.residual_block(z)                # B×hidden×H×W
-        
-        # Decoding main fields
-        main_fields = self.dec(z)                 # B×C×H×W (U, V, T, P)
-        
-        if self.predict_rd:
-            # Predict Rd as a scalar value
-            rd_scalar = self.rd_head(z)           # B×1
-            
-            # Create spatial Rd field with the same spatial dimensions as main fields
-            B, _, H, W = main_fields.shape
-            rd_field = rd_scalar.unsqueeze(-1).unsqueeze(-1)  # B×1×1×1
-            rd_field = rd_field.expand(B, 1, H, W)            # B×1×H×W
-            
-            # Concatenate main fields with Rd field
-            out = torch.cat([main_fields, rd_field], dim=1)   # B×(C+1)×H×W
-            
-            return out, rd_scalar  # Return both full output and scalar Rd for monitoring
+        if x.dim() == 5:
+            B, S, C, H, W = x.shape
+            z = self.enc(x.view(B*S, C, H, W)).view(B, S, -1, H, W)
+            z, _ = self.conv_lstm(z)
+            z = self.residual_block(z[:, -1])
         else:
-            return main_fields
+            z = self.enc(x)
+            z = z.unsqueeze(1)
+            z, _ = self.conv_lstm(z)
+            z = self.residual_block(z.squeeze(1))
+        return self.dec(z)
+
+    def forward_with_latent(self, x):
+        if x.dim() == 5:
+            B, S, C, H, W = x.shape
+            z = self.enc(x.view(B*S, C, H, W)).view(B, S, -1, H, W)
+            z, _ = self.conv_lstm(z)
+            latent = self.residual_block(z[:, -1])
+        else:
+            z = self.enc(x)
+            z = z.unsqueeze(1)
+            z, _ = self.conv_lstm(z)
+            latent = self.residual_block(z.squeeze(1))
+        return latent, latent.size(1)
 
 class ResidualBlock(nn.Module):
-    """Residual block with batch normalization."""
-    
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1),
-                nn.BatchNorm2d(out_channels)
-            )
+            self.shortcut = nn.Sequential(nn.Conv2d(in_channels, out_channels, 1), nn.BatchNorm2d(out_channels))
     
     def forward(self, x):
-        residual = x
+        res = x
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out += self.shortcut(residual)
-        out = F.relu(out)
-        return out
+        out += self.shortcut(res)
+        return F.relu(out)
 
 class DeepConvLSTM(nn.Module):
-    """Multi-layer ConvLSTM with attention mechanism."""
-    
     def __init__(self, in_channels, hidden_channels, num_layers=3, kernel_size=5, padding=2):
         super().__init__()
         self.num_layers = num_layers
-        self.hidden_channels = hidden_channels
-        
-        # ConvLSTM layers
-        self.cells = nn.ModuleList()
-        for i in range(num_layers):
-            if i == 0:
-                self.cells.append(ConvLSTM(in_channels, hidden_channels, kernel_size, padding))
-            else:
-                self.cells.append(ConvLSTM(hidden_channels, hidden_channels, kernel_size, padding))
-        
-        # Attention mechanism
-        self.attention = nn.Conv2d(hidden_channels, 1, kernel_size=1)
-    
-    def forward(self, x, hidden_states=None):
-        """Forward pass through all ConvLSTM layers.
-        
-        Args:
-            x (torch.Tensor): Input tensor [B×T×C×H×W]
-            hidden_states (list): Initial hidden states for each layer
-            
-        Returns:
-            tuple: (Output tensor, New hidden states)
-        """
-        batch_size, seq_len, _, height, width = x.size()
-        
-        if hidden_states is None:
-            hidden_states = [None] * self.num_layers
-            
-        output = x
-        new_hidden_states = []
-        
-        # Process through each layer
-        for i, cell in enumerate(self.cells):
-            output, state = cell(output, hidden_states[i])
-            new_hidden_states.append(state)
-        
-        # Apply attention to last time step
-        last_output = output[:, -1]
-        attention_weights = torch.sigmoid(self.attention(last_output))
-        output_attended = last_output * attention_weights
-        
-        new_output = output.clone()
-        new_output[:, -1] = output_attended
-            
-        return new_output, new_hidden_states
-
-class ConvLSTM(nn.Module):
-    """Enhanced Convolutional LSTM cell with peephole connections."""
-    
-    def __init__(self, in_channels, hidden_channels, kernel_size=5, padding=2):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        
-        # Combined gates computation
-        self.conv = nn.Conv2d(
-            in_channels + hidden_channels, 
-            hidden_channels * 4,  # 4 gates
-            kernel_size=kernel_size, 
-            padding=padding
-        )
-        
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm([hidden_channels, 42, 42])
-        
-        # Peephole connections
-        self.w_ci = nn.Parameter(torch.zeros(1, hidden_channels, 1, 1))
-        self.w_cf = nn.Parameter(torch.zeros(1, hidden_channels, 1, 1))
-        self.w_co = nn.Parameter(torch.zeros(1, hidden_channels, 1, 1))
-        
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize weights using Xavier initialization."""
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-            elif 'w_c' in name:
-                nn.init.xavier_uniform_(param)
-    
-    def forward(self, x, hidden_state=None):
-        """Forward pass with peephole connections and layer normalization.
-        
-        Args:
-            x (torch.Tensor): Input tensor [B×T×C×H×W]
-            hidden_state (tuple): Previous (h, c) state
-            
-        Returns:
-            tuple: (Output tensor, New state)
-        """
-        batch_size, seq_len, _, height, width = x.size()
-        
-        # Initialize hidden state if not provided
-        if hidden_state is None:
-            h_t = torch.zeros(batch_size, self.hidden_channels, height, width, device=x.device)
-            c_t = torch.zeros(batch_size, self.hidden_channels, height, width, device=x.device)
-        else:
-            h_t, c_t = hidden_state
-            
-        # Output container
-        output = torch.zeros(batch_size, seq_len, self.hidden_channels, height, width, device=x.device)
-        
-        # Process each time step
-        for t in range(seq_len):
-            x_t = x[:, t]
-            combined = torch.cat([x_t, h_t], dim=1)
-            
-            # Calculate gates
-            gates = self.conv(combined)
-            i, f, g, o = torch.chunk(gates, 4, dim=1)
-            
-            # Apply peephole connections
-            i = torch.sigmoid(i + self.w_ci * c_t)
-            f = torch.sigmoid(f + self.w_cf * c_t)
-            g = torch.tanh(g)
-            
-            # Update cell state
-            c_t_new = f * c_t + i * g
-            c_t_new = torch.clamp(c_t_new, -10, 10)  # Prevent gradient explosion
-            
-            # Output gate with peephole
-            o = torch.sigmoid(o + self.w_co * c_t_new)
-            
-            # Calculate hidden state
-            h_t_new = o * torch.tanh(c_t_new)
-            
-            # Apply layer normalization
-            if height == 42 and width == 42:
-                h_t_new = self.layer_norm(h_t_new)
-            
-            # Store output
-            output[:, t] = h_t_new
-            
-            # Update states
-            h_t = h_t_new
-            c_t = c_t_new
-        
-        return output, (h_t, c_t)
-
-class HeavyPhyCRNet(nn.Module):
-    """Heavy PhyCRNet with enhanced architecture for maximum performance."""
-    
-    def __init__(self, num_layers=12, hidden_dim=256, num_heads=8, 
-                 use_attention=True, use_skip_connections=True, use_se_blocks=True,
-                 dropout_rate=0.1, use_spectral_norm=False):
-        super(HeavyPhyCRNet, self).__init__()
-        
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self.use_attention = use_attention
-        self.use_skip_connections = use_skip_connections
-        self.use_se_blocks = use_se_blocks
-        
-        # Multi-scale input processing
-        self.input_conv = nn.Sequential(
-            nn.Conv2d(4, hidden_dim//4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim//4),
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim//4, hidden_dim//2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim//2),
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim//2, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU()
-        )
-        
-        # Multi-scale feature extraction
-        self.scale_convs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim//2, kernel_size=1),
-                nn.BatchNorm2d(hidden_dim//2),
-                nn.ReLU(),
-                nn.Conv2d(hidden_dim//2, hidden_dim//2, kernel_size=3, padding=1),
-                nn.BatchNorm2d(hidden_dim//2),
-                nn.ReLU()
-            ),
-            nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim//2, kernel_size=1),
-                nn.BatchNorm2d(hidden_dim//2),
-                nn.ReLU(),
-                nn.Conv2d(hidden_dim//2, hidden_dim//2, kernel_size=5, padding=2),
-                nn.BatchNorm2d(hidden_dim//2),
-                nn.ReLU()
-            ),
-            nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim//2, kernel_size=1),
-                nn.BatchNorm2d(hidden_dim//2),
-                nn.ReLU(),
-                nn.Conv2d(hidden_dim//2, hidden_dim//2, kernel_size=7, padding=3),
-                nn.BatchNorm2d(hidden_dim//2),
-                nn.ReLU()
-            )
+        self.cells = nn.ModuleList([
+            ConvectionLSTM(in_channels if i==0 else hidden_channels, hidden_channels, kernel_size, padding)
+            for i in range(num_layers)
         ])
+        self.attention = nn.Conv2d(hidden_channels, 1, 1)
+    
+    def forward(self, x, states=None):
+        if states is None: states = [None] * self.num_layers
+        out = x
+        new_states = []
+        for i, cell in enumerate(self.cells):
+            out, s = cell(out, states[i])
+            new_states.append(s)
+        last_out = out[:, -1]
+        attn = torch.sigmoid(self.attention(last_out))
+        out_final = out.clone(); out_final[:, -1] = last_out * attn
+        return out_final, new_states
+
+class ConvectionLSTM(nn.Module):
+    def __init__(self, in_ch, hidden_ch, kernel_size=5, padding=2):
+        super().__init__()
+        self.hidden_ch = hidden_ch
+        self.conv = nn.Conv2d(in_ch + hidden_ch, hidden_ch * 4, kernel_size, padding=padding)
         
-        self.scale_fusion = nn.Sequential(
-            nn.Conv2d(hidden_dim + 3 * (hidden_dim//2), hidden_dim, kernel_size=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU()
+        # Restoring LayerNorm for checkpoint compatibility
+        self.layer_norm = nn.LayerNorm([hidden_ch, 42, 42])
+        
+        self.w_ci = nn.Parameter(torch.zeros(1, hidden_ch, 1, 1))
+        self.w_cf = nn.Parameter(torch.zeros(1, hidden_ch, 1, 1))
+        self.w_co = nn.Parameter(torch.zeros(1, hidden_ch, 1, 1))
+
+    def forward(self, x, state=None):
+        B, T, C, H, W = x.size()
+        h, c = state if state else (torch.zeros(B, self.hidden_ch, H, W, device=x.device), torch.zeros(B, self.hidden_ch, H, W, device=x.device))
+        out = torch.zeros(B, T, self.hidden_ch, H, W, device=x.device)
+        for t in range(T):
+            gates = self.conv(torch.cat([x[:, t], h], dim=1))
+            i, f, g, o = torch.chunk(gates, 4, dim=1)
+            i = torch.sigmoid(i + self.w_ci * c)
+            f = torch.sigmoid(f + self.w_cf * c)
+            c = f * c + i * torch.tanh(g)
+            o = torch.sigmoid(o + self.w_co * c)
+            h = o * torch.tanh(c)
+            
+            # Apply LayerNorm if dimensions match (as in original code)
+            if H == 42 and W == 42:
+                h = self.layer_norm(h)
+                
+            out[:, t] = h
+        return out, (h, c)
+
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation (FiLM) Layer."""
+    def __init__(self, conditioning_dim, feature_channels):
+        super().__init__()
+        self.gamma_proj = nn.Linear(conditioning_dim, feature_channels)
+        self.beta_proj = nn.Linear(conditioning_dim, feature_channels)
+        
+        nn.init.ones_(self.gamma_proj.weight.data[:, 0])
+        if conditioning_dim > 1:
+            nn.init.zeros_(self.gamma_proj.weight.data[:, 1:])
+        nn.init.zeros_(self.gamma_proj.bias)
+        nn.init.zeros_(self.beta_proj.weight)
+        nn.init.zeros_(self.beta_proj.bias)
+    
+    def forward(self, features, conditioning):
+        gamma = self.gamma_proj(conditioning).unsqueeze(-1).unsqueeze(-1)
+        beta = self.beta_proj(conditioning).unsqueeze(-1).unsqueeze(-1)
+        return gamma * features + beta
+
+class MultiParamSurrogateModel(nn.Module):
+    """
+    Surrogate model with FiLM conditioning for 4 parameters (Ra, Ha, Q, Da).
+    Optimized for high-precision spatiotemporal sequence prediction.
+    """
+    PARAM_RANGES = {
+        'Ra': (100.0, 1e8),
+        'Ha': (0.0, 100.0),
+        'Q': (-10.0, 10.0),
+        'Da': (0.001, 0.15),
+    }
+
+    def __init__(self, input_ch=4, output_ch=4, hidden=192, use_film=True):
+        super().__init__()
+        self.use_film = use_film
+        self.hidden_channels = hidden
+        
+        # 4 extra channels for parameter projection if not using FiLM (legacy support)
+        # However, we prefer FiLM for sensitivity.
+        self.stnnn = STNNN(input_ch=input_ch + (0 if use_film else 4), 
+                          output_ch=output_ch, hidden=hidden)
+        
+        self.param_encoder = nn.Sequential(
+            nn.Linear(4, 64), nn.LeakyReLU(0.2),
+            nn.Linear(64, 128), nn.LeakyReLU(0.2),
+            nn.Linear(128, 128)
         )
         
-        # Enhanced ConvLSTM layers with attention
-        self.conv_lstm_layers = nn.ModuleList()
-        for i in range(num_layers):
-            # Calculate input and hidden dimensions more carefully
-            if i == 0:
-                input_dim = hidden_dim  # From scale fusion (256)
-                layer_hidden_dim = hidden_dim  # (256)
-            else:
-                # Input dim is the hidden dim of the previous layer
-                prev_layer_idx = i - 1
-                if prev_layer_idx < num_layers//2:
-                    input_dim = hidden_dim  # Previous layer outputs hidden_dim (256)
-                else:
-                    input_dim = hidden_dim*2  # Previous layer outputs hidden_dim*2 (512)
-                
-                # Current layer's hidden dimension
-                if i < num_layers//2:
-                    layer_hidden_dim = hidden_dim  # (256)
-                else:
-                    layer_hidden_dim = hidden_dim*2  # (512)
-            
-            # Special case: transition layer (layer 6, index 6)
-            # This layer receives 256 channels but outputs 512 channels
-            if i == num_layers//2:  # layer 6 (index 6)
-                input_dim = hidden_dim  # 256 from previous layer
-                layer_hidden_dim = hidden_dim*2  # 512 for current layer
-            
-            self.conv_lstm_layers.append(
-                EnhancedConvLSTMCell(
-                    input_dim=input_dim,
-                    hidden_dim=layer_hidden_dim,
-                    kernel_size=3,
-                    bias=True,
-                    use_attention=use_attention,
-                    num_heads=num_heads,
-                    use_se_block=use_se_blocks,
-                    dropout_rate=dropout_rate
-                )
+        if self.use_film:
+            self.film_layer = FiLMLayer(conditioning_dim=128, feature_channels=hidden)
+            self.film_decoder = nn.Sequential(
+                nn.Conv2d(hidden, hidden, 3, padding=1),
+                nn.LeakyReLU(0.2),
+                nn.Conv2d(hidden, output_ch, 1)
             )
+
+    def normalize_params(self, ra, ha, q, da):
+        log_ra = torch.log10(torch.clamp(ra, min=1.0))
+        ra_n = (log_ra - np.log10(self.PARAM_RANGES['Ra'][0])) / (np.log10(self.PARAM_RANGES['Ra'][1]) - np.log10(self.PARAM_RANGES['Ra'][0]))
+        ha_n = (ha - self.PARAM_RANGES['Ha'][0]) / (self.PARAM_RANGES['Ha'][1] - self.PARAM_RANGES['Ha'][0])
+        q_n = (q - self.PARAM_RANGES['Q'][0]) / (self.PARAM_RANGES['Q'][1] - self.PARAM_RANGES['Q'][0])
+        log_da = torch.log10(torch.clamp(da, min=1e-5))
+        da_n = (log_da - np.log10(self.PARAM_RANGES['Da'][0])) / (np.log10(self.PARAM_RANGES['Da'][1]) - np.log10(self.PARAM_RANGES['Da'][0]))
+        return ra_n, ha_n, q_n, da_n
+
+    def forward(self, x_seq, ra, ha, q, da):
+        B, S, C, H, W = x_seq.shape
+        ra_n, ha_n, q_n, da_n = self.normalize_params(ra, ha, q, da)
+        param_vec = torch.stack([ra_n, ha_n, q_n, da_n], dim=-1) # [B, 4]
         
-        # Skip connection processing
-        if use_skip_connections:
-            self.skip_convs = nn.ModuleList([
-                nn.Conv2d(hidden_dim, hidden_dim*2, kernel_size=1)  # Project to final layer size
-                for i in range(num_layers//2)
-            ])
-        
-        # Advanced output processing
-        final_hidden = hidden_dim * 2  # From last layer
-        self.output_processing = nn.Sequential(
-            nn.Conv2d(final_hidden, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
+        if self.use_film:
+            # Pass through STNNN until residual block
+            # We need to expose the latent features from STNNN
+            # For simplicity in this implementation, we'll re-implement the STNNN forward here
+            # to inject FiLM at the right place (after ConvLSTM, before Decoder)
             
-            nn.Conv2d(hidden_dim, hidden_dim//2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim//2),
-            nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
+            x_reshaped = x_seq.view(B*S, C, H, W)
+            z_reshaped = self.stnnn.enc(x_reshaped)
+            z_seq = z_reshaped.view(B, S, -1, H, W)
+            z_lstm, _ = self.stnnn.conv_lstm(z_seq)
+            latent = self.stnnn.residual_block(z_lstm[:, -1])
             
-            nn.Conv2d(hidden_dim//2, hidden_dim//4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim//4),
-            nn.ReLU(),
-        )
-        
-        # Multi-field output heads
-        self.output_heads = nn.ModuleDict({
-            'velocity': nn.Sequential(
-                nn.Conv2d(hidden_dim//4, 32, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(32, 2, kernel_size=1)  # U, V
-            ),
-            'temperature': nn.Sequential(
-                nn.Conv2d(hidden_dim//4, 32, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(32, 1, kernel_size=1)  # T
-            ),
-            'pressure': nn.Sequential(
-                nn.Conv2d(hidden_dim//4, 16, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(16, 1, kernel_size=1)  # P
-            )
-        })
-        
-        # Apply spectral normalization if requested
-        if use_spectral_norm:
-            self._apply_spectral_norm()
-        
-        # Initialize weights
-        self._initialize_weights()
-    
-    def _apply_spectral_norm(self):
-        """Apply spectral normalization to conv layers for training stability."""
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.utils.spectral_norm(module)
-    
-    def _initialize_weights(self):
-        """Initialize weights with advanced schemes."""
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, 0, 0.01)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-    
-    def forward(self, x):
-        batch_size, seq_len, channels, height, width = x.size()
-        
-        # Initialize hidden states for all layers
-        h_states = []
-        c_states = []
-        for i, layer in enumerate(self.conv_lstm_layers):
-            # Calculate hidden dimension for this layer
-            layer_hidden_dim = self.hidden_dim if i < self.num_layers//2 else self.hidden_dim*2
-            h_states.append(torch.zeros(batch_size, layer_hidden_dim, height, width, 
-                                      device=x.device, dtype=x.dtype))
-            c_states.append(torch.zeros(batch_size, layer_hidden_dim, height, width, 
-                                      device=x.device, dtype=x.dtype))
-        
-        # Process sequence
-        skip_connections = []
-        
-        for t in range(seq_len):
-            current_input = x[:, t]  # [batch_size, channels, height, width]
+            param_embed = self.param_encoder(param_vec)
+            z_modulated = self.film_layer(latent, param_embed)
+            output = self.film_decoder(z_modulated)
+        else:
+            # Legacy: concat params as channels
+            ra_ch = ra_n.view(B, 1, 1, 1, 1).expand(B, S, 1, H, W)
+            ha_ch = ha_n.view(B, 1, 1, 1, 1).expand(B, S, 1, H, W)
+            q_ch = q_n.view(B, 1, 1, 1, 1).expand(B, S, 1, H, W)
+            da_ch = da_n.view(B, 1, 1, 1, 1).expand(B, S, 1, H, W)
+            x_input = torch.cat([x_seq, ra_ch, ha_ch, q_ch, da_ch], dim=2)
+            output = self.stnnn(x_input)
             
-            # Multi-scale input processing
-            processed_input = self.input_conv(current_input)
-            
-            # Multi-scale feature extraction
-            scale_features = [processed_input]
-            for scale_conv in self.scale_convs:
-                scale_features.append(scale_conv(processed_input))
-            
-            # Fuse multi-scale features
-            fused_features = torch.cat(scale_features, dim=1)
-            layer_input = self.scale_fusion(fused_features)
-            
-            # Process through ConvLSTM layers
-            for i, layer in enumerate(self.conv_lstm_layers):
-                h_states[i], c_states[i] = layer(layer_input, (h_states[i], c_states[i]))
-                layer_input = h_states[i]
-                
-                # Store skip connections from first half of layers
-                if self.use_skip_connections and i < len(self.conv_lstm_layers)//2:
-                    if t == seq_len - 1:  # Only store from last timestep
-                        skip_connections.append(h_states[i])
-        
-        # Get final output
-        final_output = h_states[-1]
-        
-        # Apply skip connections
-        if self.use_skip_connections and skip_connections:
-            for i, (skip, skip_conv) in enumerate(zip(skip_connections, self.skip_convs)):
-                # Resize skip connection if needed
-                if skip.shape != final_output.shape:
-                    skip = F.interpolate(skip, size=final_output.shape[2:], 
-                                       mode='bilinear', align_corners=False)
-                processed_skip = skip_conv(skip)
-                final_output = final_output + processed_skip
-        
-        # Output processing
-        processed_output = self.output_processing(final_output)
-        
-        # Generate field-specific outputs
-        velocity_output = self.output_heads['velocity'](processed_output)
-        temperature_output = self.output_heads['temperature'](processed_output)
-        pressure_output = self.output_heads['pressure'](processed_output)
-        
-        # Combine outputs
-        output = torch.cat([velocity_output, temperature_output, pressure_output], dim=1)
-        
         return output
-
-class EnhancedConvLSTMCell(nn.Module):
-    """Enhanced ConvLSTM cell with attention and SE blocks."""
-    
-    def __init__(self, input_dim, hidden_dim, kernel_size, bias=True,
-                 use_attention=True, num_heads=8, use_se_block=True, dropout_rate=0.1):
-        super(EnhancedConvLSTMCell, self).__init__()
-        
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.kernel_size = kernel_size
-        self.padding = kernel_size // 2
-        self.bias = bias
-        self.use_attention = use_attention
-        self.use_se_block = use_se_block
-        
-        # Standard ConvLSTM gates
-        self.conv_gates = nn.Conv2d(input_dim + hidden_dim, 4 * hidden_dim,
-                                   kernel_size, padding=self.padding, bias=bias)
-        
-        # Attention mechanism
-        if use_attention:
-            self.attention = SpatialAttention(hidden_dim, num_heads)
-        
-        # Squeeze-and-Excitation block
-        if use_se_block:
-            self.se_block = SEBlock(hidden_dim)
-        
-        # Dropout for regularization
-        self.dropout = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity()
-        
-        # Layer normalization
-        self.layer_norm = nn.GroupNorm(min(32, hidden_dim//4), hidden_dim)
-        
-    def forward(self, input_tensor, cur_state):
-        h_cur, c_cur = cur_state
-        
-        # Concatenate input and hidden state
-        combined = torch.cat([input_tensor, h_cur], dim=1)
-        
-        # Compute gates
-        gates = self.conv_gates(combined)
-        
-        # Split gates
-        i_gate, f_gate, c_gate, o_gate = torch.split(gates, self.hidden_dim, dim=1)
-        
-        # Apply activations
-        i_gate = torch.sigmoid(i_gate)
-        f_gate = torch.sigmoid(f_gate)
-        c_gate = torch.tanh(c_gate)
-        o_gate = torch.sigmoid(o_gate)
-        
-        # Update cell state
-        c_next = f_gate * c_cur + i_gate * c_gate
-        
-        # Compute hidden state
-        h_next = o_gate * torch.tanh(c_next)
-        
-        # Apply attention
-        if self.use_attention:
-            h_next = self.attention(h_next)
-        
-        # Apply SE block
-        if self.use_se_block:
-            h_next = self.se_block(h_next)
-        
-        # Apply normalization and dropout
-        h_next = self.layer_norm(h_next)
-        h_next = self.dropout(h_next)
-        
-        return h_next, c_next
-
-class SpatialAttention(nn.Module):
-    """Spatial attention mechanism for ConvLSTM."""
-    
-    def __init__(self, hidden_dim, num_heads=8):
-        super(SpatialAttention, self).__init__()
-        self.num_heads = num_heads
-        self.hidden_dim = hidden_dim
-        self.head_dim = hidden_dim // num_heads
-        
-        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
-        
-        self.query_conv = nn.Conv2d(hidden_dim, hidden_dim, 1)
-        self.key_conv = nn.Conv2d(hidden_dim, hidden_dim, 1)
-        self.value_conv = nn.Conv2d(hidden_dim, hidden_dim, 1)
-        self.output_conv = nn.Conv2d(hidden_dim, hidden_dim, 1)
-        
-        self.scale = self.head_dim ** -0.5
-        
-    def forward(self, x):
-        batch_size, channels, height, width = x.size()
-        
-        # Generate query, key, value
-        q = self.query_conv(x).view(batch_size, self.num_heads, self.head_dim, height * width)
-        k = self.key_conv(x).view(batch_size, self.num_heads, self.head_dim, height * width)
-        v = self.value_conv(x).view(batch_size, self.num_heads, self.head_dim, height * width)
-        
-        # Attention computation
-        attention_scores = torch.matmul(q.transpose(-2, -1), k) * self.scale
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        
-        # Apply attention
-        attended = torch.matmul(v, attention_weights.transpose(-2, -1))
-        attended = attended.view(batch_size, channels, height, width)
-        
-        # Output projection
-        output = self.output_conv(attended)
-        
-        return x + output  # Residual connection
-
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block."""
-    
-    def __init__(self, channels, reduction=16):
-        super(SEBlock, self).__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        batch_size, channels, _, _ = x.size()
-        y = self.squeeze(x).view(batch_size, channels)
-        y = self.excitation(y).view(batch_size, channels, 1, 1)
-        return x * y.expand_as(x) 

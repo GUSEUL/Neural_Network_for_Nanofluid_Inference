@@ -13,6 +13,9 @@ The framework treats the fluid simulation as a spatiotemporal sequence predictio
   - **Shape**: `[Batch, Sequence_Length, Channels, Height, Width]`
   - **Channels (4)**: $u$ (x-velocity), $v$ (y-velocity), $T$ (temperature), and $P$ (pressure).
   - **Default Sequence**: Usually 3 frames representing states at $t-2, t-1, t$.
+- **HDF5 Caching (Performance Optimization)**: 
+  - To accelerate training, `.mat` files are pre-processed into HDF5 format. 
+  - This caches entire spatiotemporal sequences, reducing data loading time by 5-10x compared to reading `.mat` files on-the-fly.
 - **Physical Parameters**: Four scalar values $(Ra, Ha, Q, Da)$ are provided.
   - These are normalized and injected into the network via **FiLM (Feature-wise Linear Modulation)** layers or concatenation to condition the flow field generation.
 

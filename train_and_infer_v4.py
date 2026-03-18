@@ -275,21 +275,44 @@ class MultiParamPhysicsLoss(nn.Module):
         return mse, q_inferred.mean()
 
 # =============================================================================
-# 3. Training Logic (Fixed FP16 Instability)
+# 3. Training Logic (Fixed FP16 Instability & Auto-Normalization)
 # =============================================================================
+def calculate_physics_normalization(model, dataloader, phys_fn, device, num_batches=3):
+    """Measures initial physics loss scales to prevent exploding gradients."""
+    print(f"\n  [Setup] Calculating Physics Normalization Weights ({num_batches} batches)...")
+    model.eval()
+    accum = {'continuity': [], 'momentum_x': [], 'momentum_y': [], 'energy': []}
+    
+    with torch.no_grad():
+        for i, (inp, tgt, pd) in enumerate(dataloader):
+            if i >= num_batches: break
+            inp = inp.to(device)
+            r, h, q, d = pd['Ra'].to(device), pd['Ha'].to(device), pd['Q'].to(device), pd['Da'].to(device)
+            
+            with autocast('cuda'):
+                pred = model(inp, r, h, q, d)
+            
+            p_losses = phys_fn.physics_residual_loss(inp[:, -1].float(), pred.float(), r, h, q, d)
+            for k in accum.keys():
+                val = p_losses[k].mean().item()
+                if np.isfinite(val) and val > 0:
+                    accum[k].append(val)
+    
+    weights = {}
+    for k, vals in accum.items():
+        mean_val = np.mean(vals) if vals else 1.0
+        # Target scale is ~0.1 to match initial MSE roughly
+        weights[k] = 1.0 / (mean_val + 1e-9)
+        print(f"    - {k:10s} | Raw Mean: {mean_val:.2e} | Norm Weight: {weights[k]:.2e}")
+    
+    return weights
+
 def train_model(args, model, train_loader, val_loader, device):
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
     scaler = GradScaler('cuda')
     
-    best_val_loss = float('inf')
-    last_val_loss = 0.0 
-    target_physics_lambda = 0.05
-    warmup_threshold = int(args.epochs * 0.15)
-    ramp_up_period = int(args.epochs * 0.10)
-    
-    loss_history = []
-    
+    # 1. Physics Normalization
     if hasattr(train_loader.dataset, 'datasets'):
         sample_ds = train_loader.dataset.datasets[0]
     else:
@@ -303,6 +326,31 @@ def train_model(args, model, train_loader, val_loader, device):
     phys = MultiParamPhysicsLoss(phys_init_params, sample_ds.nano_props, 
                                 dt=sample_ds.params.get('dt', 0.0001), 
                                 dx=1.0/(sample_ds.nx-1), dy=1.0/(sample_ds.ny-1)).to(device)
+
+    norm_weights = calculate_physics_normalization(model, train_loader, phys, device)
+
+    # 2. Pre-train Check
+    print("\n  [Check] Pre-train Physics Loss Verification:")
+    model.eval()
+    with torch.no_grad():
+        inp, tgt, pd = next(iter(train_loader))
+        inp = inp.to(device); r, h, q, d = pd['Ra'].to(device), pd['Ha'].to(device), pd['Q'].to(device), pd['Da'].to(device)
+        pred = model(inp, r, h, q, d)
+        p_l = phys.physics_residual_loss(inp[:, -1].float(), pred.float(), r, h, q, d)
+        
+        raw_total = sum(v.mean().item() for v in p_l.values())
+        norm_total = sum(p_l[k].mean().item() * norm_weights[k] for k in p_l.keys())
+        print(f"    - Raw Total Physics Loss:  {raw_total:.2e}")
+        print(f"    - Norm Total Physics Loss: {norm_total:.6f} (Should be near 1.0~4.0)")
+        print(f"    - Initial Data Loss (MSE): {F.mse_loss(pred, tgt.to(device)).item():.6f}")
+
+    best_val_loss = float('inf')
+    last_val_loss = 0.0 
+    target_physics_lambda = 0.05
+    warmup_threshold = int(args.epochs * 0.15)
+    ramp_up_period = int(args.epochs * 0.10)
+    
+    loss_history = []
 
     for epoch in range(args.epochs):
         if epoch < warmup_threshold:
@@ -325,19 +373,17 @@ def train_model(args, model, train_loader, val_loader, device):
             
             optimizer.zero_grad(set_to_none=True)
             
-            # 1. Forward pass (Mixed Precision)
             with autocast('cuda'):
                 pred = model(inp, r, h, q, d)
                 loss_mse = F.mse_loss(pred, tgt)
                 
-            # 2. Physics pass (FP32 to avoid instability with 2nd order derivatives)
             if current_phys_lambda > 0:
-                pred_fp32 = pred.float()
-                inp_fp32 = inp[:, -1].float()
-                p_losses = phys.physics_residual_loss(inp_fp32, pred_fp32, r, h, q, d)
-                # mean() required here because p_losses now returns [B] tensors
-                loss_phys = p_losses['continuity'].mean() + p_losses['momentum_x'].mean() + \
-                            p_losses['momentum_y'].mean() + p_losses['energy'].mean()
+                p_losses = phys.physics_residual_loss(inp[:, -1].float(), pred.float(), r, h, q, d)
+                # Apply Normalization Weights
+                loss_phys = (p_losses['continuity'].mean() * norm_weights['continuity'] + 
+                            p_losses['momentum_x'].mean() * norm_weights['momentum_x'] + 
+                            p_losses['momentum_y'].mean() * norm_weights['momentum_y'] + 
+                            p_losses['energy'].mean() * norm_weights['energy'])
             else:
                 loss_phys = torch.tensor(0.0, device=device)
                 

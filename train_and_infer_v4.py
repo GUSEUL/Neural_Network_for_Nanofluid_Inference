@@ -205,7 +205,7 @@ class MultiParamPhysicsLoss(nn.Module):
             'energy':     res_e.pow(2).mean(dim=[1, 2, 3])
         }
 
-    # Consistency Loss Utilities (Fixed Unnorm Dummy Variables & Dimensions)
+    # Consistency Loss Utilities (Stabilized with Log-scale and Normalization)
     def da_consistency_loss(self, un, vn, pn_x, un_x, vn_x, d_guess, steady=False):
         z_t = torch.zeros_like(un)
         u, v, _, _ = self.unnorm(un, vn, z_t, z_t)
@@ -215,13 +215,16 @@ class MultiParamPhysicsLoss(nn.Module):
         dudt = 0 if steady else (ux - u) / self.dt
         
         rhs = dudt + ux*ux_x + vx*ux_y + px_x - self.nu_r*self.Pr*(ux_xx+ux_yy)
-        da_inferred = -(self.nu_r * self.Pr * ux) / (rhs + 1e-8)
-        da_inferred = torch.clamp(da_inferred, 0.001, 0.2)
+        # Numerical stability: avoid division by zero and extreme values
+        da_inferred = -(self.nu_r * self.Pr * ux) / (rhs + 1e-7)
+        da_inferred = torch.clamp(da_inferred, 1e-5, 1.0)
 
-        # da_inferred is [B, 1, H, W], d_guess is [B]
-        d_target = d_guess.view(-1, 1, 1, 1).expand_as(da_inferred)
-        mse = F.mse_loss(da_inferred, d_target, reduction='none').mean(dim=[1, 2, 3])
-        return mse, da_inferred.mean()
+        # Log-scale comparison for Da (0.001 to 0.15)
+        log_da_inf = torch.log10(da_inferred)
+        log_da_tgt = torch.log10(torch.clamp(d_guess.view(-1, 1, 1, 1), 1e-5, 1.0)).expand_as(log_da_inf)
+        mse = F.mse_loss(log_da_inf, log_da_tgt, reduction='none').mean(dim=[1, 2, 3])
+        return mse, da_inferred.mean(dim=[1, 2, 3])
+
     def ra_consistency_loss(self, un, vn, pn_x, un_x, vn_x, tn_x, r_guess, d_val, h_val, steady=False):
         z_t = torch.zeros_like(un)
         u, v, _, _ = self.unnorm(un, vn, z_t, z_t)
@@ -232,13 +235,14 @@ class MultiParamPhysicsLoss(nn.Module):
         
         rb = d_val.view(-1, 1, 1, 1); hab = h_val.view(-1, 1, 1, 1)
         rhs = dvdt + ux*vx_x + vx*vx_y + px_y - self.nu_r*self.Pr*(vx_xx+vx_yy) + (self.nu_r*self.Pr/rb)*vx + (self.sigma_r*self.rho_r*hab**2*self.Pr)*vx
-        ra_inferred = rhs / (self.beta_r * self.Pr * tx + 1e-8)
-        ra_inferred = torch.clamp(ra_inferred, 100, 1e8)
+        ra_inferred = rhs / (self.beta_r * self.Pr * tx + 1e-7)
+        ra_inferred = torch.clamp(ra_inferred, 10.0, 1e9)
         
-        # ra_inferred is [B, 1, H, W], r_guess is [B]
-        r_target = r_guess.view(-1, 1, 1, 1).expand_as(ra_inferred)
-        mse = F.mse_loss(ra_inferred / 1e6, r_target / 1e6, reduction='none').mean(dim=[1, 2, 3])
-        return mse, ra_inferred.mean()
+        # Log-scale comparison for Ra (1e2 to 1e8)
+        log_ra_inf = torch.log10(ra_inferred)
+        log_ra_tgt = torch.log10(r_guess.view(-1, 1, 1, 1)).expand_as(log_ra_inf)
+        mse = F.mse_loss(log_ra_inf, log_ra_tgt, reduction='none').mean(dim=[1, 2, 3])
+        return mse, ra_inferred.mean(dim=[1, 2, 3])
 
     def ha_consistency_loss(self, un, vn, pn_x, un_x, vn_x, tn_x, h_guess, r_val, d_val, steady=False):
         z_t = torch.zeros_like(un)
@@ -250,13 +254,13 @@ class MultiParamPhysicsLoss(nn.Module):
         
         rb = d_val.view(-1, 1, 1, 1); rab = r_val.view(-1, 1, 1, 1)
         rhs = -(dvdt + ux*vx_x + vx*vx_y + px_y - self.nu_r*self.Pr*(vx_xx+vx_yy) - self.beta_r*rab*self.Pr*tx + (self.nu_r*self.Pr/rb)*vx)
-        ha_sq_inferred = rhs / (self.sigma_r * self.rho_r * self.Pr * vx + 1e-8)
-        ha_inferred = torch.sqrt(torch.clamp(ha_sq_inferred, 0, 10000))
+        ha_sq_inferred = rhs / (self.sigma_r * self.rho_r * self.Pr * vx + 1e-7)
+        ha_inferred = torch.sqrt(torch.clamp(ha_sq_inferred, 0, 1e5))
         
-        # ha_inferred is [B, 1, H, W], h_guess is [B]
+        # Normalized comparison for Ha (0 to 100)
         h_target = h_guess.view(-1, 1, 1, 1).expand_as(ha_inferred)
-        mse = F.mse_loss(ha_inferred, h_target, reduction='none').mean(dim=[1, 2, 3])
-        return mse, ha_inferred.mean()
+        mse = F.mse_loss(ha_inferred / 100.0, h_target / 100.0, reduction='none').mean(dim=[1, 2, 3])
+        return mse, ha_inferred.mean(dim=[1, 2, 3])
 
     def q_consistency_loss(self, un, vn, tn, tn_x, q_guess, steady=False):
         z_t = torch.zeros_like(un)
@@ -266,13 +270,13 @@ class MultiParamPhysicsLoss(nn.Module):
         dtdt = 0 if steady else (tx - t) / self.dt
         
         rhs = dtdt + ux*tx_x + vx*tx_y - self.alpha_r*(tx_xx+tx_yy)
-        q_inferred = rhs / (self.cp_r * tx + 1e-8)
-        q_inferred = torch.clamp(q_inferred, -10, 10)
+        q_inferred = rhs / (self.cp_r * tx + 1e-7)
+        q_inferred = torch.clamp(q_inferred, -20, 20)
         
-        # q_inferred is [B, 1, H, W], q_guess is [B]
+        # Normalized comparison for Q (-10 to 10)
         q_target = q_guess.view(-1, 1, 1, 1).expand_as(q_inferred)
-        mse = F.mse_loss(q_inferred, q_target, reduction='none').mean(dim=[1, 2, 3])
-        return mse, q_inferred.mean()
+        mse = F.mse_loss(q_inferred / 10.0, q_target / 10.0, reduction='none').mean(dim=[1, 2, 3])
+        return mse, q_inferred.mean(dim=[1, 2, 3])
 
 # =============================================================================
 # 3. Training Logic (Fixed FP16 Instability & Auto-Normalization)
@@ -447,15 +451,55 @@ def train_model(args, model, train_loader, val_loader, device):
 # =============================================================================
 # 4. Ultra Inference Logic (Fixed Leaf Tensor In-Place Mod & Reshaping)
 # =============================================================================
-def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, norm_weights=None, num_restarts=4):
+def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, norm_weights=None, num_restarts=4, log_prefix="inf"):
     model.eval()
     num_samples = min(config.get('num_inference_samples', 20), len(dataset))
     indices = np.linspace(0, len(dataset) - 1, num_samples, dtype=int)
     batch_input = torch.stack([dataset[i][0] for i in indices]).to(device)
     batch_target = torch.stack([dataset[i][1] for i in indices]).to(device)
 
-    # 1. Unified Latent Space: [restarts, 4] in range [0, 1]
-    p_latent = torch.rand((num_restarts, 4), device=device, requires_grad=True)
+    # 0. Initialize Log File
+    os.makedirs("inference_logs", exist_ok=True)
+    log_path = os.path.join("inference_logs", f"{log_prefix}_steps.txt")
+    log_f = open(log_path, "w")
+    def log_print(msg):
+        print(msg)
+        log_f.write(msg + "\n")
+        log_f.flush()
+
+    log_print(f"    [Ultra] Starting Inference for prefix: {log_prefix}")
+
+    # 1. Automatic Physics Normalization for Inference
+    log_print("    [Ultra] Calculating Case-Specific Physics Normalization...")
+    with torch.no_grad():
+        # Use initial p_raw to estimate scales
+        p_raw_sample = torch.randn((num_restarts, 4), device=device)
+        p_lat_sample = torch.sigmoid(p_raw_sample)
+        def get_params_local(latent): # Local helper for scaling
+            ra = 10**(np.log10(config['ra_min']) + (np.log10(config['ra_max']) - np.log10(config['ra_min'])) * latent[:, 0])
+            ha = config['ha_min'] + (config['ha_max'] - config['ha_min']) * latent[:, 1]
+            q = config['q_min'] + (config['q_max'] - config['q_min']) * latent[:, 2]
+            da = 10**(np.log10(config['da_min']) + (np.log10(config['da_max']) - np.log10(config['da_min'])) * latent[:, 3])
+            return ra, ha, q, da
+        ra_s, ha_s, q_s, da_s = get_params_local(p_lat_sample)
+        r_es, h_es, q_es, d_es = [x.unsqueeze(1).expand(-1, num_samples).reshape(-1) for x in [ra_s, ha_s, q_s, da_s]]
+        pred_s = model(batch_input.repeat(num_restarts, 1, 1, 1, 1), r_es, h_es, q_es, d_es)
+        p_l_s = physics_loss_fn.physics_residual_loss(batch_input.repeat(num_restarts, 1, 1, 1, 1)[:, -1], pred_s, r_es, h_es, q_es, d_es)
+        
+        # Calculate normalization weights: target scale is ~0.1
+        actual_norm_weights = {}
+        for k in ['continuity', 'momentum_x', 'momentum_y', 'energy']:
+            raw_val = p_l_s[k].mean().item()
+            # If norm_weights was passed, treat it as relative importance (e.g. 3.0 for energy)
+            rel_importance = norm_weights.get(k, 1.0) if norm_weights else 1.0
+            actual_norm_weights[k] = rel_importance / (raw_val + 1e-9)
+            log_print(f"      - {k:10s} | Raw Scale: {raw_val:.2e} | Final Weight: {actual_norm_weights[k]:.2e}")
+
+    # Use the calculated weights for the rest of the function
+    norm_weights = actual_norm_weights
+
+    # 2. Unified Latent Space: [restarts, 4] transformed via sigmoid to [0, 1]
+    p_raw = torch.randn((num_restarts, 4), device=device, requires_grad=True)
 
     def get_physical_params(latent):
         ra = 10**(np.log10(config['ra_min']) + (np.log10(config['ra_max']) - np.log10(config['ra_min'])) * latent[:, 0])
@@ -464,15 +508,22 @@ def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, 
         da = 10**(np.log10(config['da_min']) + (np.log10(config['da_max']) - np.log10(config['da_min'])) * latent[:, 3])
         return ra, ha, q, da
 
-    optimizer_adam = optim.Adam([p_latent], lr=config['inference_lr'])
+    optimizer_adam = optim.Adam([p_raw], lr=config['inference_lr'])
     scheduler_adam = optim.lr_scheduler.CosineAnnealingLR(optimizer_adam, T_max=config['inference_steps'], eta_min=config['inference_lr']*0.1)
 
-    print(f"    [Ultra] Adam Phase ({config['inference_steps']} steps)...")
+    # Initial loss calculation to ensure l_data is always defined
+    with torch.no_grad():
+        p_latent_init = torch.sigmoid(p_raw)
+        ra_i, ha_i, q_i, da_i = get_physical_params(p_latent_init)
+        r_ei, h_ei, q_ei, d_ei = [x.unsqueeze(1).expand(-1, num_samples).reshape(-1) for x in [ra_i, ha_i, q_i, da_i]]
+        pred_i = model(batch_input.repeat(num_restarts, 1, 1, 1, 1), r_ei, h_ei, q_ei, d_ei)
+        l_data = (pred_i - batch_target.repeat(num_restarts, 1, 1, 1)).pow(2).view(num_restarts, num_samples, -1).mean(dim=(1, 2))
+
+    log_print(f"    [Ultra] Adam Phase ({config['inference_steps']} steps)...")
     for step in range(config['inference_steps']):
         optimizer_adam.zero_grad(set_to_none=True)
-        # Fix: bypass autograd tracking with .data
-        with torch.no_grad(): p_latent.data.clamp_(0.0, 1.0)
-
+        
+        p_latent = torch.sigmoid(p_raw)
         ra, ha, q, da = get_physical_params(p_latent)
         r_e, h_e, q_e, d_e = [x.unsqueeze(1).expand(-1, num_samples).reshape(-1) for x in [ra, ha, q, da]]
 
@@ -481,7 +532,6 @@ def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, 
 
         p_l = physics_loss_fn.physics_residual_loss(batch_input.repeat(num_restarts, 1, 1, 1, 1)[:, -1], pred, r_e, h_e, q_e, d_e)
         
-        # p_l['...'] returns a tensor of size [restarts * num_samples] now
         l_phys = (p_l['continuity'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('continuity', 1.0) +
                   p_l['momentum_x'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('momentum_x', 1.0) +
                   p_l['momentum_y'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('momentum_y', 3.0) +
@@ -490,46 +540,138 @@ def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, 
         # Consistency
         un, vn, tn = torch.chunk(batch_input.repeat(num_restarts, 1, 1, 1, 1)[:, -1], 4, 1)[:3]
         unx, vnx, tnx, pnx = torch.chunk(pred, 4, 1)
-        lcd, _ = physics_loss_fn.da_consistency_loss(un, vn, pnx, unx, vnx, d_e)
-        lcr, _ = physics_loss_fn.ra_consistency_loss(un, vn, pnx, unx, vnx, tnx, r_e, d_e, h_e)
-        lch, _ = physics_loss_fn.ha_consistency_loss(un, vn, pnx, unx, vnx, tnx, h_e, r_e, d_e)
-        lcq, _ = physics_loss_fn.q_consistency_loss(un, vn, tn, tnx, q_e)
+        
+        # Capture both MSE and Inferred values
+        lcd, inf_da = physics_loss_fn.da_consistency_loss(un, vn, pnx, unx, vnx, d_e)
+        lcr, inf_ra = physics_loss_fn.ra_consistency_loss(un, vn, pnx, unx, vnx, tnx, r_e, d_e, h_e)
+        lch, inf_ha = physics_loss_fn.ha_consistency_loss(un, vn, pnx, unx, vnx, tnx, h_e, r_e, d_e)
+        lcq, inf_q = physics_loss_fn.q_consistency_loss(un, vn, tn, tnx, q_e)
+        
         l_cons = (lcd + lcr + lch + lcq).view(num_restarts, num_samples).mean(dim=1)
         
         l_bound = physics_loss_fn.boundary_loss(pred).view(num_restarts, num_samples).mean(dim=1)
 
-        loss_total = (l_data + 2.0 * l_phys + 2.0 * l_cons + 5.0 * l_bound).mean()
+        # 20.0*Data + 0.2*Cons for better balance
+        loss_total = (20.0 * l_data + 1.0 * l_phys + 0.2 * l_cons + 2.0 * l_bound).mean()
         loss_total.backward()
+        
+        # Add Gradient Clipping
+        torch.nn.utils.clip_grad_norm_([p_raw], max_norm=1.0)
+        
         optimizer_adam.step()
         scheduler_adam.step()
 
         if step % 10 == 0:
-            bi = torch.argmin(l_data).item()
-            print(f"      Step {step:4d} | Best Ra:{ra[bi]:.2e} Ha:{ha[bi]:.2f} Q:{q[bi]:.2f} Da:{da[bi]:.4f} | Data Loss: {l_data[bi]:.6f}")
+            with torch.no_grad():
+                l_total_restart = (10.0 * l_data + 1.0 * l_phys + 1.0 * l_cons + 2.0 * l_bound)
+                bi = torch.argmin(l_total_restart).item()
+            
+            log_print(f"      Step {step:4d} | Guess: Ra:{ra[bi]:.2e} Ha:{ha[bi]:.2f} Q:{q[bi]:.2f} Da:{da[bi]:.4f}")
+            log_print(f"             | Infer: Ra:{inf_ra:.2e} Ha:{inf_ha:.2f} Q:{inf_q:.2f} Da:{inf_da:.4f}")
+            log_print(f"             | LOSSES: Data:{l_data[bi]:.4f} Phys:{l_phys[bi]:.4f} Cons:{l_cons[bi]:.4f} Bound:{l_bound[bi]:.4f}")
 
     # L-BFGS Refinement
     with torch.no_grad():
         bi = torch.argmin(l_data).item()
-        p_best = p_latent[bi:bi+1].detach().clone().requires_grad_(True)
+        p_best_raw = p_raw[bi:bi+1].detach().clone().requires_grad_(True)
     
-    print(f"\n    [Ultra] L-BFGS Refinement...")
-    optimizer_lbfgs = optim.LBFGS([p_best], lr=0.01, max_iter=50, line_search_fn='strong_wolfe')
+    lbfgs_iters = config.get('lbfgs_steps', 100)
+    log_print(f"\n    [Ultra] L-BFGS Refinement (Max {lbfgs_iters} iters)...")
+    optimizer_lbfgs = optim.LBFGS([p_best_raw], lr=1.0, max_iter=lbfgs_iters, line_search_fn='strong_wolfe')
 
+    iter_count = 0
     def closure():
+        nonlocal iter_count
         optimizer_lbfgs.zero_grad()
-        # Fix: bypass autograd tracking with .data
-        with torch.no_grad(): p_best.data.clamp_(0.0, 1.0)
-        ra, ha, q, da = get_physical_params(p_best)
+        p_latent_best = torch.sigmoid(p_best_raw)
+        ra, ha, q, da = get_physical_params(p_latent_best)
         r_e, h_e, q_e, d_e = [x.expand(num_samples) for x in [ra, ha, q, da]]
-        p = model(batch_input, r_e, h_e, q_e, d_e)
-        ld = (p - batch_target).pow(2).mean()
-        lb = physics_loss_fn.boundary_loss(p).mean()
-        lt = ld + 5.0 * lb
+        
+        pred = model(batch_input, r_e, h_e, q_e, d_e)
+        
+        ld = (pred - batch_target).pow(2).mean()
+        
+        p_l = physics_loss_fn.physics_residual_loss(batch_input[:, -1], pred, r_e, h_e, q_e, d_e)
+        l_phys = (p_l['continuity'].mean() * norm_weights.get('continuity', 1.0) +
+                  p_l['momentum_x'].mean() * norm_weights.get('momentum_x', 1.0) +
+                  p_l['momentum_y'].mean() * norm_weights.get('momentum_y', 3.0) +
+                  p_l['energy'].mean() * norm_weights.get('energy', 3.0))
+
+        un, vn, tn = torch.chunk(batch_input[:, -1], 4, 1)[:3]
+        unx, vnx, tnx, pnx = torch.chunk(pred, 4, 1)
+        lcd, _ = physics_loss_fn.da_consistency_loss(un, vn, pnx, unx, vnx, d_e)
+        lcr, _ = physics_loss_fn.ra_consistency_loss(un, vn, pnx, unx, vnx, tnx, r_e, d_e, h_e)
+        lch, _ = physics_loss_fn.ha_consistency_loss(un, vn, pnx, unx, vnx, tnx, h_e, r_e, d_e)
+        lcq, _ = physics_loss_fn.q_consistency_loss(un, vn, tn, tnx, q_e)
+        l_cons = (lcd + lcr + lch + lcq).mean()
+        
+        lb = physics_loss_fn.boundary_loss(pred).mean()
+        
+        lt = ld + 2.0 * l_phys + 2.0 * l_cons + 5.0 * lb
         lt.backward()
+
+        if iter_count % 10 == 0:
+            log_print(f"      Iter {iter_count:3d} | Ra:{ra.item():.2e} Ha:{ha.item():.2f} Q:{q.item():.2f} Da:{da.item():.4f} | Loss: {lt.item():.6f}")
+        
+        iter_count += 1
         return lt
 
     optimizer_lbfgs.step(closure)
-    ra, ha, q, da = get_physical_params(p_best)
+    p_latent_final = torch.sigmoid(p_best_raw)
+    ra, ha, q, da = get_physical_params(p_latent_final)
+    
+    log_f.close()
+    return {'Ra': ra.item(), 'Ha': ha.item(), 'Q': q.item(), 'Da': da.item()}
+
+    # L-BFGS Refinement
+    with torch.no_grad():
+        bi = torch.argmin(l_data).item()
+        p_best_raw = p_raw[bi:bi+1].detach().clone().requires_grad_(True)
+    
+    lbfgs_iters = config.get('lbfgs_steps', 100)
+    print(f"\n    [Ultra] L-BFGS Refinement (Max {lbfgs_iters} iters)...")
+    optimizer_lbfgs = optim.LBFGS([p_best_raw], lr=1.0, max_iter=lbfgs_iters, line_search_fn='strong_wolfe')
+
+    iter_count = 0
+    def closure():
+        nonlocal iter_count
+        optimizer_lbfgs.zero_grad()
+        p_latent_best = torch.sigmoid(p_best_raw)
+        ra, ha, q, da = get_physical_params(p_latent_best)
+        r_e, h_e, q_e, d_e = [x.expand(num_samples) for x in [ra, ha, q, da]]
+        
+        pred = model(batch_input, r_e, h_e, q_e, d_e)
+        
+        ld = (pred - batch_target).pow(2).mean()
+        
+        p_l = physics_loss_fn.physics_residual_loss(batch_input[:, -1], pred, r_e, h_e, q_e, d_e)
+        l_phys = (p_l['continuity'].mean() * norm_weights.get('continuity', 1.0) +
+                  p_l['momentum_x'].mean() * norm_weights.get('momentum_x', 1.0) +
+                  p_l['momentum_y'].mean() * norm_weights.get('momentum_y', 3.0) +
+                  p_l['energy'].mean() * norm_weights.get('energy', 3.0))
+
+        un, vn, tn = torch.chunk(batch_input[:, -1], 4, 1)[:3]
+        unx, vnx, tnx, pnx = torch.chunk(pred, 4, 1)
+        lcd, _ = physics_loss_fn.da_consistency_loss(un, vn, pnx, unx, vnx, d_e)
+        lcr, _ = physics_loss_fn.ra_consistency_loss(un, vn, pnx, unx, vnx, tnx, r_e, d_e, h_e)
+        lch, _ = physics_loss_fn.ha_consistency_loss(un, vn, pnx, unx, vnx, tnx, h_e, r_e, d_e)
+        lcq, _ = physics_loss_fn.q_consistency_loss(un, vn, tn, tnx, q_e)
+        l_cons = (lcd + lcr + lch + lcq).mean()
+        
+        lb = physics_loss_fn.boundary_loss(pred).mean()
+        
+        lt = ld + 2.0 * l_phys + 2.0 * l_cons + 5.0 * lb
+        lt.backward()
+
+        if iter_count % 10 == 0:
+            print(f"      Iter {iter_count:3d} | Ra:{ra.item():.2e} Ha:{ha.item():.2f} Q:{q.item():.2f} Da:{da.item():.4f} | Loss: {lt.item():.6f}")
+        
+        iter_count += 1
+        return lt
+
+    optimizer_lbfgs.step(closure)
+    p_latent_final = torch.sigmoid(p_best_raw)
+    ra, ha, q, da = get_physical_params(p_latent_final)
     return {'Ra': ra.item(), 'Ha': ha.item(), 'Q': q.item(), 'Da': da.item()}
 
 # =============================================================================
@@ -587,6 +729,7 @@ def main():
     print("\nStarting Ultra-Precision Inference on Test Set...")
     inf_config = {
         'inference_steps': 1500, 'inference_lr': 0.005,
+        'lbfgs_steps': 100,
         'ra_min': 100, 'ra_max': 1e8, 'ha_min': 0, 'ha_max': 100,
         'q_min': -10, 'q_max': 10, 'da_min': 0.001, 'da_max': 0.15,
         'num_inference_samples': 20

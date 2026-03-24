@@ -8,6 +8,8 @@
 !models.py
 !train_and_infer_v4.py
 !ultra_inference_test.py
+!visualize_ra_inference.py
+!train_and_infer_ra_v4_exact.py
 
 !data/
-data/*
+data/*                       

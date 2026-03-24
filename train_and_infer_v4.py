@@ -520,6 +520,7 @@ def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, 
         l_data = (pred_i - batch_target.repeat(num_restarts, 1, 1, 1)).pow(2).view(num_restarts, num_samples, -1).mean(dim=(1, 2))
 
     log_print(f"    [Ultra] Adam Phase ({config['inference_steps']} steps)...")
+    warmup_steps = 500 # Steps to focus only on Data scale
     for step in range(config['inference_steps']):
         optimizer_adam.zero_grad(set_to_none=True)
         
@@ -530,45 +531,58 @@ def predict_multi_params_ultra(model, physics_loss_fn, dataset, config, device, 
         pred = model(batch_input.repeat(num_restarts, 1, 1, 1, 1), r_e, h_e, q_e, d_e)
         l_data = (pred - batch_target.repeat(num_restarts, 1, 1, 1)).pow(2).view(num_restarts, num_samples, -1).mean(dim=(1, 2))
 
-        p_l = physics_loss_fn.physics_residual_loss(batch_input.repeat(num_restarts, 1, 1, 1, 1)[:, -1], pred, r_e, h_e, q_e, d_e)
-        
-        l_phys = (p_l['continuity'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('continuity', 1.0) +
-                  p_l['momentum_x'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('momentum_x', 1.0) +
-                  p_l['momentum_y'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('momentum_y', 3.0) +
-                  p_l['energy'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('energy', 3.0))
+        # Phase selection
+        if step < warmup_steps:
+            # Stage 1: Focus purely on matching the data pattern to get Ra scale right
+            loss_total = l_data.mean()
+            l_phys = torch.zeros_like(l_data)
+            l_cons = torch.zeros_like(l_data)
+            l_bound = torch.zeros_like(l_data)
+            # Dummy values for logging
+            inf_ra = ra; inf_ha = ha; inf_q = q; inf_da = da
+            lcr_r = l_cons; lch_r = l_cons; lcq_r = l_cons; lcd_r = l_cons
+        else:
+            # Stage 2: Refine with Physics and Consistency
+            p_l = physics_loss_fn.physics_residual_loss(batch_input.repeat(num_restarts, 1, 1, 1, 1)[:, -1], pred, r_e, h_e, q_e, d_e)
+            l_phys = (p_l['continuity'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('continuity', 1.0) +
+                      p_l['momentum_x'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('momentum_x', 1.0) +
+                      p_l['momentum_y'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('momentum_y', 3.0) +
+                      p_l['energy'].view(num_restarts, num_samples).mean(dim=1) * norm_weights.get('energy', 3.0))
 
-        # Consistency
-        un, vn, tn = torch.chunk(batch_input.repeat(num_restarts, 1, 1, 1, 1)[:, -1], 4, 1)[:3]
-        unx, vnx, tnx, pnx = torch.chunk(pred, 4, 1)
-        
-        # Capture both MSE and Inferred values
-        lcd, inf_da = physics_loss_fn.da_consistency_loss(un, vn, pnx, unx, vnx, d_e)
-        lcr, inf_ra = physics_loss_fn.ra_consistency_loss(un, vn, pnx, unx, vnx, tnx, r_e, d_e, h_e)
-        lch, inf_ha = physics_loss_fn.ha_consistency_loss(un, vn, pnx, unx, vnx, tnx, h_e, r_e, d_e)
-        lcq, inf_q = physics_loss_fn.q_consistency_loss(un, vn, tn, tnx, q_e)
-        
-        l_cons = (lcd + lcr + lch + lcq).view(num_restarts, num_samples).mean(dim=1)
-        
-        l_bound = physics_loss_fn.boundary_loss(pred).view(num_restarts, num_samples).mean(dim=1)
+            un, vn, tn = torch.chunk(batch_input.repeat(num_restarts, 1, 1, 1, 1)[:, -1], 4, 1)[:3]
+            unx, vnx, tnx, pnx = torch.chunk(pred, 4, 1)
+            lcd, inf_da = physics_loss_fn.da_consistency_loss(un, vn, pnx, unx, vnx, d_e)
+            lcr, inf_ra = physics_loss_fn.ra_consistency_loss(un, vn, pnx, unx, vnx, tnx, r_e, d_e, h_e)
+            lch, inf_ha = physics_loss_fn.ha_consistency_loss(un, vn, pnx, unx, vnx, tnx, h_e, r_e, d_e)
+            lcq, inf_q = physics_loss_fn.q_consistency_loss(un, vn, tn, tnx, q_e)
+            
+            lcd_r = lcd.view(num_restarts, num_samples).mean(dim=1)
+            lcr_r = lcr.view(num_restarts, num_samples).mean(dim=1)
+            lch_r = lch.view(num_restarts, num_samples).mean(dim=1)
+            lcq_r = lcq.view(num_restarts, num_samples).mean(dim=1)
+            l_cons = lcd_r + lcr_r + lch_r + lcq_r
+            l_bound = physics_loss_fn.boundary_loss(pred).view(num_restarts, num_samples).mean(dim=1)
 
-        # 20.0*Data + 0.2*Cons for better balance
-        loss_total = (20.0 * l_data + 1.0 * l_phys + 0.2 * l_cons + 2.0 * l_bound).mean()
+            # High Data weight (50.0) and lower Physics/Cons to prevent Ra drop
+            loss_total = (50.0 * l_data + 0.5 * l_phys + 0.1 * l_cons + 2.0 * l_bound).mean()
+
         loss_total.backward()
-        
-        # Add Gradient Clipping
         torch.nn.utils.clip_grad_norm_([p_raw], max_norm=1.0)
-        
         optimizer_adam.step()
         scheduler_adam.step()
 
         if step % 10 == 0:
             with torch.no_grad():
-                l_total_restart = (10.0 * l_data + 1.0 * l_phys + 1.0 * l_cons + 2.0 * l_bound)
-                bi = torch.argmin(l_total_restart).item()
+                # During warmup, pick best based on Data. After, pick based on Weighted Total.
+                sel_metric = l_data if step < warmup_steps else (20.0 * l_data + 1.0 * l_phys)
+                bi = torch.argmin(sel_metric).item()
             
-            log_print(f"      Step {step:4d} | Guess: Ra:{ra[bi]:.2e} Ha:{ha[bi]:.2f} Q:{q[bi]:.2f} Da:{da[bi]:.4f}")
-            log_print(f"             | Infer: Ra:{inf_ra:.2e} Ha:{inf_ha:.2f} Q:{inf_q:.2f} Da:{inf_da:.4f}")
-            log_print(f"             | LOSSES: Data:{l_data[bi]:.4f} Phys:{l_phys[bi]:.4f} Cons:{l_cons[bi]:.4f} Bound:{l_bound[bi]:.4f}")
+            phase = "WARMUP" if step < warmup_steps else "HYBRID"
+            log_print(f"      Step {step:4d} [{phase}] | Guess: Ra:{ra[bi].item():.2e} Ha:{ha[bi].item():.2f} Q:{q[bi].item():.2f} Da:{da[bi].item():.4f}")
+            if step >= warmup_steps:
+                log_print(f"             | Infer: Ra:{inf_ra[bi].item():.2e} Ha:{inf_ha[bi].item():.2f} Q:{inf_q[bi].item():.2f} Da:{inf_da[bi].item():.4f}")
+                log_print(f"             | C-Loss:Ra:{lcr_r[bi].item():.4f} Ha:{lch_r[bi].item():.4f} Q:{lcq_r[bi].item():.4f} Da:{lcd_r[bi].item():.4f}")
+            log_print(f"             | LOSSES: Data:{l_data[bi].item():.4f} Phys:{l_phys[bi].item():.4f} Total:{loss_total.item():.4f}")
 
     # L-BFGS Refinement
     with torch.no_grad():
